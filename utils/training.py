@@ -206,7 +206,7 @@ def train(model: ContinualModel, dataset: ContinualDataset,
         metrics_manager = AdvancedMetricsManager(metrics_config)
         logging.info("Advanced metrics enabled: Representational Stability, Weight Change, Gradient Interference")
 
-    with track_system_stats(logger) as system_tracker:
+    with track_system_stats(logger, disabled=getattr(args, 'disable_system_stats', False)) as system_tracker:
         results, results_mask_classes = [], []
 
         if args.eval_future:

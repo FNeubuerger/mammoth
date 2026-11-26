@@ -62,6 +62,10 @@ def evaluate(model: 'ContinualModel', dataset: 'ContinualDataset', last=False, r
         if last and k < len(dataset.test_loaders) - 1:
             continue
         correct, correct_mask_classes, total = 0.0, 0.0, 0.0
+        report_recall = getattr(dataset, 'REPORT_CLASS_RECALL', False)
+        if report_recall:
+            support = torch.zeros(n_classes, dtype=torch.long, device=model.device)
+            hits = torch.zeros_like(support)
         test_iter = iter(test_loader)
         i = 0
         while True:
@@ -87,6 +91,9 @@ def evaluate(model: 'ContinualModel', dataset: 'ContinualDataset', last=False, r
 
             _, pred = torch.max(outputs[:, :n_classes].data, 1)
             correct += torch.sum(pred == labels).item()
+            if report_recall:
+                support += torch.bincount(labels, minlength=n_classes)
+                hits += torch.bincount(labels[pred == labels], minlength=n_classes)
             total += labels.shape[0]
             i += 1
             pbar.set_postfix({f'acc_task_{k+1}': max(0, correct / total * 100)}, refresh=False)
@@ -99,6 +106,9 @@ def evaluate(model: 'ContinualModel', dataset: 'ContinualDataset', last=False, r
                 correct_mask_classes += torch.sum(pred == labels).item()
 
         tot_seen_samples += total
+        if report_recall:
+            logging.info("Class recall counts for domain %d: hits=%s support=%s", k,
+                         hits.tolist(), support.tolist())
 
         if correct > correct_mask_classes and dataset.SETTING == 'class-il':
             logging.warning("Task-IL accuracy is LOWER than Class-IL accuracy. "

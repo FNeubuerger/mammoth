@@ -7,16 +7,10 @@
 #         https://data.nasa.gov/dataset/cmapss-jet-engine-simulated-data
 #
 # C-MAPSS is natively a regression benchmark (predict Remaining Useful Life,
-# RUL, in cycles). We recast it as Class-IL by (a) capping and binning RUL
-# into 3 discrete health states -- Healthy (RUL >= 100), Degrading
-# (30 <= RUL < 100), Critical (RUL < 30) -- a standard RUL-capping scheme in
-# the prognostics literature, and (b) treating each of the four FD00X
-# sub-datasets (which differ in operating-condition count and fault mode) as
-# one task with its own 3 classes, giving 4 tasks x 3 classes = 12 total
-# classes. This mirrors the "task-specific class copies" construction used
-# for SECOM: the underlying health states repeat across tasks, but are
-# treated as distinct classes so the benchmark fits mammoth's Class-IL
-# infrastructure.
+# RUL, in cycles). This adaptation caps RUL at 130 cycles, bins it into three
+# health states, and treats each FD00X subset as a domain-incremental task.
+# The same three labels are shared across domains; they are not duplicated
+# into task-specific classes.
 
 import os
 import numpy as np
@@ -54,7 +48,9 @@ def _load_subset_windows(data_path, subset, train, feat_mean=None, feat_std=None
     features = raw[:, 2:2 + N_FEATURES].astype(np.float32)
 
     if not train:
-        rul_final = np.loadtxt(os.path.join(data_path, f'RUL_{subset}.txt')).astype(np.float32)
+        rul_final = np.atleast_1d(
+            np.loadtxt(os.path.join(data_path, f'RUL_{subset}.txt')).astype(np.float32)
+        )
 
     if feat_mean is None or feat_std is None:
         feat_mean = features.mean(axis=0)
@@ -86,30 +82,36 @@ def _load_subset_windows(data_path, subset, train, feat_mean=None, feat_std=None
 
 
 class CMAPSSDataset(Dataset):
-    """C-MAPSS dataset wrapped for Mammoth v2 (sliding windows over all 4 FD00X subsets)."""
+    """C-MAPSS sliding windows for one or more FD00X operating domains."""
 
-    def __init__(self, data_path, train=True, subset_stats=None):
+    def __init__(self, data_path, train=True, subset_stats=None, subsets=None):
         self.data_path = data_path
         self.train = train
         self.subset_stats = subset_stats or {}
+        self.subsets = list(FD_SUBSETS if subsets is None else subsets)
+        if not self.subsets or len(set(self.subsets)) != len(self.subsets):
+            raise ValueError("subsets must be a non-empty sequence of unique FD00X names")
+        unknown = set(self.subsets) - set(FD_SUBSETS)
+        if unknown:
+            raise ValueError(f"Unknown C-MAPSS subsets: {sorted(unknown)}")
         self._load_data()
 
     def _load_data(self):
         all_windows, all_labels = [], []
-        for task_idx, subset in enumerate(FD_SUBSETS):
+        for subset in self.subsets:
             mean, std = self.subset_stats.get(subset, (None, None))
             windows, bins, mean, std = _load_subset_windows(
                 self.data_path, subset, self.train, feat_mean=mean, feat_std=std)
             self.subset_stats[subset] = (mean, std)
             all_windows.append(windows)
-            all_labels.append(bins + task_idx * 3)
+            all_labels.append(bins)
 
         windows = np.concatenate(all_windows, axis=0)
         labels = np.concatenate(all_labels, axis=0)
 
         self.data = torch.from_numpy(windows)
         self.targets = torch.from_numpy(labels)
-        print(f"Loaded {len(labels)} C-MAPSS windows across {len(FD_SUBSETS)} subsets "
+        print(f"Loaded {len(labels)} C-MAPSS windows from {', '.join(self.subsets)} "
               f"({'train' if self.train else 'test'})")
 
     def __len__(self):
@@ -123,30 +125,43 @@ class CMAPSSDataset(Dataset):
 
 class CMAPSSContinual(ContinualDataset):
     """
-    NASA C-MAPSS turbofan degradation, recast as Class-IL.
+    NASA C-MAPSS turbofan degradation under domain-incremental learning.
 
-    Setting: Class-incremental learning, 4 tasks (FD001-FD004) of 3 classes
-    each (Healthy / Degrading / Critical RUL bins), 12 classes total.
+    Each FD00X subset is a task/domain. The same three RUL health-state
+    labels are used in every domain; no task-specific copies are introduced.
     """
 
     NAME = 'cmapss'
-    SETTING = 'class-il'
+    SETTING = 'domain-il'
     N_CLASSES_PER_TASK = 3
     N_TASKS = 4
+    N_CLASSES = 3
+    REPORT_CLASS_RECALL = True
     SIZE = (N_FEATURES,)
 
     def __init__(self, args):
         super().__init__(args)
+        self._task_idx = 0
 
     def get_data_loaders(self):
+        if self._task_idx >= len(FD_SUBSETS):
+            raise RuntimeError("All C-MAPSS operating domains have already been loaded")
+        subset = FD_SUBSETS[self._task_idx]
         train_dataset = CMAPSSDataset(
-            data_path=os.path.join(base_path(), 'CMAPSS'), train=True)
+            data_path=os.path.join(base_path(), 'CMAPSS'),
+            train=True,
+            subsets=[subset],
+        )
         test_dataset = CMAPSSDataset(
-            data_path=os.path.join(base_path(), 'CMAPSS'), train=False,
-            subset_stats=train_dataset.subset_stats)
+            data_path=os.path.join(base_path(), 'CMAPSS'),
+            train=False,
+            subset_stats=train_dataset.subset_stats,
+            subsets=[subset],
+        )
 
         train, test = store_masked_loaders(train_dataset, test_dataset, self)
         self.train_loader = train
+        self._task_idx += 1
         return train, test
 
     @staticmethod

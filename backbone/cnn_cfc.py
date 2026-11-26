@@ -75,9 +75,8 @@ class ResNet(MammothBackbone):
         
         Architecture Philosophy:
         - ResNet extracts spatial features from images
-        - CfC processes these features temporally (useful for video/sequences)
-        - For single images in CL: CfC acts as a recurrent readout layer
-          that maintains hidden state across batches/tasks
+        - CfC processes one pooled feature vector per image as a single timestep
+        - Hidden state is passed between calls only when explicitly provided
         
         :param block: the basic ResNet block
         :param num_blocks: the number of blocks per layer
@@ -107,11 +106,7 @@ class ResNet(MammothBackbone):
         self.feature_dim = nf * 8 * block.expansion
         
         if self.use_cfc:
-            # CfC as a recurrent processing layer
-            # Note: For single images, we can either:
-            # 1. Treat each spatial location as a timestep (use feature maps)
-            # 2. Use CfC as a stateful readout (process batch as sequence)
-            # Here we use option 2: process features with recurrent dynamics
+            # Each image contributes one timestep; images in the batch are independent.
             
             if use_ncp_wiring:
                 from ncps.wirings import AutoNCP
@@ -144,7 +139,7 @@ class ResNet(MammothBackbone):
         )
         self.classifier = self.linear
         
-        # Hidden state for CfC (persistent across batches if needed)
+        # Stores the last state for callers that explicitly pass it back as hx.
         self.hidden_state = None
 
     def _make_layer(self, block: BasicBlock, planes: int,
@@ -168,10 +163,9 @@ class ResNet(MammothBackbone):
         """
         Compute a forward pass.
         
-        For CfC version:
-        - Extract spatial features with ResNet
-        - Process through CfC for temporal/recurrent processing
-        - CfC maintains hidden state that could stabilize learning
+        Each image is pooled to one feature vector and processed as a
+        length-one sequence. State is not carried across calls unless `hx`
+        is explicitly supplied.
         
         :param x: input tensor (batch_size, channels, height, width)
         :param returnt: return type (a string among 'out', 'features', 'all')
@@ -194,7 +188,6 @@ class ResNet(MammothBackbone):
         if self.use_cfc:
             # Process features through CfC
             # Reshape to (batch, 1, features) - single timestep per image
-            # Alternative: could process batch as sequence (batch_size, seq_len, features)
             feature_seq = feature.unsqueeze(1)  # (batch_size, 1, feature_dim)
             
             if hx is not None:
@@ -241,18 +234,18 @@ def CFCresnet18(nclasses: int, nf: int=64) -> ResNet:
 
 
 @register_backbone('cnn-cfc')
-def cnn_cfc(num_classes: int, nf: int = 64, use_cfc: bool = True, cfc_hidden_size: int = 256):
-    """ResNet18 with CfC temporal processing."""
+def cnn_cfc(num_classes: int, nf: int = 20, use_cfc: bool = True, cfc_hidden_size: int = 256):
+    """ResNet-18 feature extractor with a CfC head; nf matches resnet18_vanilla by default."""
     return ResNet(BasicBlock, [2, 2, 2, 2], num_classes, nf, use_cfc=use_cfc, cfc_hidden_size=cfc_hidden_size)
 
 @register_backbone('cnn_dense_cfc')
-def cnn_dense_cfc(input_size: int = 3, num_classes: int = 10, 
+def cnn_dense_cfc(input_size: int = 3, num_classes: int = None,
              cfc_hidden_size: int = 256):
     """ResNet-18 with Dense CfC classifier."""
     return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, nf=20, 
                   use_cfc=True, cfc_hidden_size=cfc_hidden_size, use_ncp_wiring=False)
 
 @register_backbone('resnet18_vanilla')
-def resnet18_vanilla(input_size: int = 3, num_classes: int = 10):
+def resnet18_vanilla(input_size: int = 3, num_classes: int = None):
     """Standard ResNet-18 backbone (Vanilla)."""
     return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, nf=20, use_cfc=False)

@@ -155,6 +155,8 @@ class track_system_stats:
         Print the memory usage statistics.
         """
 
+        if self.disabled:
+            return
         cpu_res, gpu_res = self.get_stats()
 
         # Print initial, average, final, and max memory usage

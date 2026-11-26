@@ -456,6 +456,15 @@ def extend_args(args, dataset):
         logging.info(f'Logging to wandb: {args.wandb_entity}/{args.wandb_project}')
         args.nowand = 0
 
+    # A single SIZE dimension also describes tabular datasets. Only these datasets
+    # provide ordered sensor windows; do not reinterpret arbitrary vectors as time.
+    if args.backbone == 'hope':
+        if dataset.NAME in ('tennessee-eastman', 'tennessee-eastman-joint', 'cmapss'):
+            args.sequence_features = dataset.SIZE[0]
+        if args.surprise_threshold is None:
+            # Temporal local gradients include a 1/T pooling factor.
+            args.surprise_threshold = 1e-6 if args.sequence_features else 0.15
+
     # Inject input_size and input_channels for backbones that require them (e.g. HOPE)
     if not hasattr(args, 'input_size') or args.input_size is None:
         if hasattr(dataset, 'SIZE'):

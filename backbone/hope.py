@@ -1,7 +1,8 @@
+import math
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Dict, Optional, Tuple, List, Set
+from typing import Dict, Optional, List
 from backbone import MammothBackbone, register_backbone
 
 # --- Titan Memory ---
@@ -9,7 +10,7 @@ from backbone import MammothBackbone, register_backbone
 class TitanMemory(nn.Module):
     """
     Simplified TITAN-style associative memory.
-    A neural memory module that can be updated at test time.
+    Local teaching updates are supervised training operations, not test-time adaptation.
     """
     def __init__(self, dim: int, hidden_multiplier: int = 4, layers: int = 2):
         super().__init__()
@@ -31,70 +32,32 @@ class TitanMemory(nn.Module):
         self.net = nn.Sequential(*blocks)
         self.norm = nn.LayerNorm(dim)
         self.grad_clip = 1.0
+        self.local_updates = 0
 
     def forward(self, query: torch.Tensor) -> torch.Tensor:
         # Query: [Batch, Seq, Dim]
         out = self.net(query)
         return self.norm(out)
 
-    def update(self, key: torch.Tensor, value: torch.Tensor, error_signal: Optional[torch.Tensor] = None, lr: float = 1e-3, surprise_threshold: float = 1e-6):
-        """
-        Update the memory parameters based on key-value pair and error signal.
-        This is a simplified version of Titan's update.
-        """
-        # In a real Titan implementation, this would update the 'memory' weights.
-        # Here we simulate it by updating the MLP weights using the error signal.
-        # This requires 'torch.enable_grad()' context if called during inference/forward.
-        
-        if error_signal is None:
-            return
-
-        # STABILITY FIX: Gating threshold to skip updates if signal is noise
-        if error_signal.norm() < surprise_threshold:
-            return
-
-        # Simple SGD update on the weights
-        # We need to compute gradients of the output w.r.t. weights given the error signal.
-        # But we don't have the output here.
-        # We assume 'update' is called after a forward pass or we re-run forward.
-        
+    def update(self, key, error_signal, lr, momentum=0.0):
+        """Apply a local gradient without accumulating into the supervised optimizer's .grad."""
+        params = tuple(self.net.parameters())
         with torch.enable_grad():
-            pred = self.net(key)
-            
-            # STABILITY FIX: Scale signal 
-            teach_scale = 0.1
-            error_signal = error_signal * teach_scale
-            
-            # Loss: minimize distance to value (or minimize error_signal if it's a gradient)
-            # If error_signal is the gradient of the loss w.r.t. output, we can backward it.
-            
-            # Assuming error_signal is dL/dOutput
-            # We want to update weights W: W_new = W - lr * dL/dW
-            # dL/dW = dL/dOutput * dOutput/dW
-            
-            # We can use torch.autograd.backward
-            if error_signal.shape != pred.shape:
-                error_signal = error_signal.expand_as(pred)
-            
-            # Safety check for NaNs
-            if torch.isnan(error_signal).any() or torch.isinf(error_signal).any():
-                return
-
-            # Check for NaNs in prediction
-            if torch.isnan(pred).any() or torch.isinf(pred).any():
-                return
-
-            torch.autograd.backward(pred, grad_tensors=error_signal, inputs=list(self.net.parameters()), retain_graph=False)
-            
-            # Clip gradients
-            # STABILITY FIX: Ensure strict clipping
-            torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.grad_clip)
-            
-            with torch.no_grad():
-                for param in self.net.parameters():
-                    if param.grad is not None:
-                        param.add_(param.grad, alpha=-lr)
-                        param.grad.zero_()
+            pred = self.net(key.detach())
+            grads = torch.autograd.grad(pred, params, grad_outputs=(0.1 * error_signal).expand_as(pred))
+        with torch.no_grad():
+            norm = torch.stack([g.norm() for g in grads]).norm()
+            if not torch.isfinite(norm):
+                raise FloatingPointError(f"Nonfinite TitanMemory local gradient norm ({norm.item()}); update aborted")
+            scale = (self.grad_clip / (norm + 1e-6)).clamp(max=1)
+            for param, grad in zip(params, grads):
+                delta = grad * scale
+                if momentum:
+                    if not hasattr(param, 'momentum_buffer'):
+                        param.momentum_buffer = torch.zeros_like(param)
+                    delta = param.momentum_buffer.mul_(momentum).add_(delta)
+                param.add_(delta, alpha=-lr)
+            self.local_updates += 1
 
 # --- CMS (Contextual Memory System) ---
 
@@ -139,84 +102,17 @@ class CMS(nn.Module):
             return current, inputs, outputs
         return current
 
-    def maybe_update(self, inputs, outputs, teach_signal, lr=1e-3, surprise_threshold=1e-6):
-        """
-        Check update periods and update blocks if needed.
-        """
+    def maybe_update(self, inputs, teach_signal, lr, momentum):
+        """Count training minibatches, including those below the surprise gate."""
         self.step_counter += 1
-        
-        if teach_signal is not None:
-            # DEBUG LOGGING (Sample approx every 100 steps)
-            if self.step_counter % 100 == 0:
-                log_norm = teach_signal.norm().item()
-                # print(f"[HOPE] Step {self.step_counter} | Signal Norm: {log_norm:.4f} | Threshold: {surprise_threshold}")
-
-            # STABILITY FIX: Gating threshold
-            if teach_signal.norm() < surprise_threshold:
-                return
-
-        for i, level in enumerate(self.levels):
-            name = level['name']
-            period = level['period']
-            
-            if self.step_counter % period == 0:
-                block = self.blocks[i]
-                inp = inputs[name].detach()
-                
-                with torch.enable_grad():
-                    pred = block.net(inp) 
-                    if teach_signal is not None:
-                        # Very simplified: try to align output with teach_signal
-                        # If teach_signal is dL/dFeatures, we can use it directly?
-                        # Or treat it as a target?
-                        # Let's assume teach_signal is a gradient.
-                        
-                        if teach_signal.shape != pred.shape:
-                            teach_signal = teach_signal.expand_as(pred)
-                        
-                        # STABILITY FIX: Scale signal
-                        teach_signal = teach_signal * 0.1
-
-                        # Safety check for NaNs
-                        if torch.isnan(teach_signal).any() or torch.isinf(teach_signal).any():
-                            continue
-
-                        # Check for NaNs in prediction
-                        if torch.isnan(pred).any() or torch.isinf(pred).any():
-                            continue
-                            
-                        # DEBUG LOGGING (Sample approx every 100 steps)
-                        if self.step_counter % 100 == 0 and i == 0:
-                             print(f"[HOPE] Step {self.step_counter} | Level: {name} | Signal Norm: {teach_signal.norm().item():.4f} | Surprise Thresh: {surprise_threshold}")
-
-                        torch.autograd.backward(pred, grad_tensors=teach_signal, inputs=list(block.parameters()), retain_graph=False)
-                        
-                        # Clip gradients
-                        torch.nn.utils.clip_grad_norm_(block.parameters(), 1.0)
-
-                        # MOMENTUM UPDATE (Simulating M3/Optimizer behavior)
-                        with torch.no_grad():
-                            momentum = 0.9
-                            for param in block.parameters():
-                                if param.grad is not None:
-                                    # Very basic momentum implementation
-                                    if not hasattr(param, 'momentum_buffer'):
-                                        param.momentum_buffer = torch.zeros_like(param.data)
-                                    
-                                    buf = param.momentum_buffer
-                                    buf.mul_(momentum).add_(param.grad, alpha=1.0)
-                                    
-                                    # Update weight
-                                    param.add_(buf, alpha=-lr)
-                                    param.grad.zero_()
+        if teach_signal is None:
+            return
+        for level, block in zip(self.levels, self.blocks):
+            if self.step_counter % level['period'] == 0:
+                block.update(inputs[level['name']], teach_signal, lr, momentum)
 
     def consolidate(self):
-        """
-        Consolidate memory.
-        In the corrected Nested Learning implementation, consolidation happens
-        continuously via multi-frequency updates. Explicit copying is destructive.
-        Keeping method for API compatibility but making it no-op.
-        """
+        """No task-boundary transfer: this variant only updates during training."""
         pass
 
 # --- Self Modifier ---
@@ -260,7 +156,8 @@ class HOPEBlock(nn.Module):
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
 
-    def forward(self, x: torch.Tensor, teach_signal: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, teach_signal: Optional[torch.Tensor] = None,
+                local_lr: float = 1e-3, local_momentum: float = 0.9) -> torch.Tensor:
         # x: [B, S, D]
         
         # 1. Attention
@@ -272,7 +169,7 @@ class HOPEBlock(nn.Module):
         combined = x + mem_out
         
         # 3. CMS
-        cms_out, cms_inputs, cms_outputs = self.cms(combined, return_intermediates=True)
+        cms_out, cms_inputs, _ = self.cms(combined, return_intermediates=True)
         out = self.norm2(cms_out)
         
         # 4. Updates (if teach_signal is present)
@@ -285,11 +182,14 @@ class HOPEBlock(nn.Module):
                 scale = torch.clamp(teach_norm / teach_clip, min=1.0)
                 teach_signal = teach_signal / scale
             
-            # Update Titan
-            self.titan.update(key=x, value=x, error_signal=teach_signal, surprise_threshold=self.surprise_threshold)
-            
-            # Update CMS
-            self.cms.maybe_update(cms_inputs, cms_outputs, teach_signal, surprise_threshold=self.surprise_threshold)
+            magnitude = teach_signal.norm()
+            if not torch.isfinite(magnitude):
+                raise FloatingPointError("Nonfinite HOPE teaching signal; update aborted")
+            if magnitude >= self.surprise_threshold:
+                self.titan.update(x, teach_signal, local_lr)
+            else:
+                teach_signal = None
+            self.cms.maybe_update(cms_inputs, teach_signal, local_lr, local_momentum)
             
         return out
 
@@ -299,7 +199,10 @@ class HOPEBlock(nn.Module):
 # --- HOPE Backbone ---
 
 class HOPEBackbone(MammothBackbone):
-    def __init__(self, input_size: int, input_channels: int, num_classes: int, dim: int = 128, depth: int = 2, heads: int = 4, surprise_threshold: float = 1e-6):
+    """Patch-based image classifier or window classifier with one token per timestep."""
+
+    def __init__(self, input_size: int, input_channels: int, num_classes: int, dim: int = 128,
+                 depth: int = 2, heads: int = 4, surprise_threshold: float = 1e-6, sequence_features: int = 0):
         super(HOPEBackbone, self).__init__()
         
         self.input_size = input_size # e.g. 32 for CIFAR
@@ -307,12 +210,15 @@ class HOPEBackbone(MammothBackbone):
         self.dim = dim
         self.num_classes = num_classes
         
-        # Patch Embedding
-        num_patches = (input_size // self.patch_size) ** 2
-        self.patch_embed = nn.Conv2d(input_channels, dim, kernel_size=self.patch_size, stride=self.patch_size)
-        
-        # Positional Embedding
-        self.pos_embed = nn.Parameter(torch.randn(1, num_patches, dim) * 0.02)
+        self.sequence_features = sequence_features
+        if sequence_features:
+            self.sensor_embed = nn.Linear(sequence_features, dim)
+            frequencies = torch.exp(-math.log(10000.0) * torch.arange(0, dim, 2) / dim)
+            self.register_buffer("position_frequencies", frequencies, persistent=False)
+        else:
+            num_patches = (input_size // self.patch_size) ** 2
+            self.patch_embed = nn.Conv2d(input_channels, dim, kernel_size=self.patch_size, stride=self.patch_size)
+            self.pos_embed = nn.Parameter(torch.randn(1, num_patches, dim) * 0.02)
         
         # HOPE Blocks
         self.blocks = nn.ModuleList([
@@ -329,19 +235,25 @@ class HOPEBackbone(MammothBackbone):
         for block in self.blocks:
              block.consolidate()
 
-    def forward(self, x: torch.Tensor, returnt: str = 'out', teach_signal: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # x: [B, C, H, W]
-        
-        # Patch Embed
-        x = self.patch_embed(x) # [B, D, H', W']
-        x = x.flatten(2).transpose(1, 2) # [B, S, D]
-        
-        # Add Pos Embed
-        x = x + self.pos_embed
+    def forward(self, x: torch.Tensor, returnt: str = 'out', teach_signal: Optional[torch.Tensor] = None,
+                local_lr: float = 1e-3, local_momentum: float = 0.9) -> torch.Tensor:
+        """Classify independent complete windows [B,T,C] or square images [B,C,H,W]."""
+        if self.sequence_features:
+            if x.ndim != 3 or x.shape[1] == 0 or x.shape[2] != self.sequence_features:
+                raise ValueError(f"Expected [B,T,{self.sequence_features}] with T>0, got {tuple(x.shape)}")
+            x = self.sensor_embed(x)
+            angles = torch.arange(x.shape[1], device=x.device)[:, None] * self.position_frequencies
+            positions = torch.stack((angles.sin(), angles.cos()), dim=-1).flatten(1)[:, :self.dim]
+            x = x + positions.to(x.dtype)
+            if teach_signal is not None:
+                # The classifier's feature is a *mean* of T tokens.
+                teach_signal = teach_signal / x.shape[1]
+        else:
+            x = self.patch_embed(x).flatten(2).transpose(1, 2) + self.pos_embed
         
         # Blocks
         for block in self.blocks:
-            x = block(x, teach_signal=teach_signal)
+            x = block(x, teach_signal=teach_signal, local_lr=local_lr, local_momentum=local_momentum)
             
         # Pooling (Mean)
         features = x.mean(dim=1) # [B, D]
@@ -358,10 +270,14 @@ class HOPEBackbone(MammothBackbone):
         return logits
 
 @register_backbone("hope")
-def hope(input_size: int = None, input_channels: int = None, num_classes: int = None, dim: int = 128, depth: int = 2, heads: int = 4, surprise_threshold: float = 1e-6) -> MammothBackbone:
+def hope(input_size: int = None, input_channels: int = None, num_classes: int = None, dim: int = 128,
+         depth: int = 2, heads: int = 4, surprise_threshold: float = 1e-6, sequence_features: int = 0) -> MammothBackbone:
     """
     Instantiates the HOPE backbone.
     """
-    if input_size is None or input_channels is None or num_classes is None:
-        raise ValueError("input_size, input_channels and num_classes must be provided")
-    return HOPEBackbone(input_size, input_channels, num_classes, dim=dim, depth=depth, heads=heads, surprise_threshold=surprise_threshold)
+    if num_classes is None:
+        raise ValueError("num_classes must be provided")
+    if not sequence_features and (input_size is None or input_channels is None):
+        raise ValueError("Provide input_size and input_channels for images, or sequence_features for windows")
+    return HOPEBackbone(input_size, input_channels, num_classes, dim=dim, depth=depth, heads=heads,
+                        surprise_threshold=surprise_threshold, sequence_features=sequence_features)
